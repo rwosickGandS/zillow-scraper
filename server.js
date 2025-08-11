@@ -1,4 +1,7 @@
-// server.js — Zillow zestimate fetcher (Playwright + Robust RapidAPI fallback w/ city/ZIP validation)
+// server.js — Zillow zestimate fetcher
+// Playwright scrape + Robust RapidAPI fallback (multi-endpoint + city/ZIP validation)
+// + Automatic address variants (directionals + abbrev/expanded street types)
+
 import express from "express";
 import { chromium } from "playwright";
 
@@ -30,7 +33,6 @@ const norm = (s) =>
     .trim();
 
 function buildSearchUrl(address, city, state, zip) {
-  // Zillow accepts a JSON-encoded searchQueryState reliably
   const usersSearchTerm = [address, city, state, zip].filter(Boolean).join(", ");
   const sqs = {
     pagination: {},
@@ -53,11 +55,9 @@ async function getTextFrom(page, selector) {
 }
 
 async function waitAndGetAnyDataBlob(page) {
-  // Give the page time to hydrate and try a small scroll to trigger loaders
   await page.waitForTimeout(1200);
   await page.mouse.wheel(0, 800);
   await page.waitForTimeout(800);
-
   const selectors = [
     'script#__NEXT_DATA__',
     'script[data-zrr-shared-data-key="searchPageStore"]',
@@ -109,7 +109,6 @@ function extractZpidAndZestimate(anyObj) {
     "homeDetails.zestimate",
     "props.pageProps.componentProps.gdpClientCache.default.zestimate"
   ]);
-
   const zpidCandidate = tryPaths(anyObj, [
     "homeInfo.zpid",
     "zpid",
@@ -117,15 +116,12 @@ function extractZpidAndZestimate(anyObj) {
     "props.pageProps.componentProps.zpid"
   ]);
 
-  let zestimate =
-    typeof zestimateCandidate === "number" ? zestimateCandidate : null;
-
+  let zestimate = typeof zestimateCandidate === "number" ? zestimateCandidate : null;
   let zpid =
     typeof zpidCandidate === "number" || typeof zpidCandidate === "string"
       ? Number(String(zpidCandidate).replace(/\D/g, "")) || null
       : null;
 
-  // Fallback regex scan across the serialized JSON
   const asStr = JSON.stringify(anyObj);
   if (!zestimate) {
     const m = asStr.match(/"zestimate"\s*:\s*(\d{4,9})/);
@@ -135,8 +131,73 @@ function extractZpidAndZestimate(anyObj) {
     const m2 = asStr.match(/"zpid"\s*:\s*"?(\d+)"?/);
     if (m2) zpid = Number(m2[1]);
   }
-
   return { zpid, zestimate };
+}
+
+/* -------- Address variant generation (directionals + abbrev/expanded) -------- */
+
+function generateAddressVariants(address) {
+  const variants = new Set();
+  const base = String(address || "").trim();
+
+  if (!base) return [];
+
+  // Always include the original
+  variants.add(base);
+
+  const abbrToFull = {
+    " St ": " Street ",
+    " Dr ": " Drive ",
+    " Rd ": " Road ",
+    " Ave ": " Avenue ",
+    " Ln ": " Lane ",
+    " Ct ": " Court ",
+    " Blvd ": " Boulevard ",
+    " Pkwy ": " Parkway ",
+    " Ter ": " Terrace ",
+    " Cir ": " Circle ",
+  };
+  const fullToAbbr = {
+    " Street ": " St ",
+    " Drive ": " Dr ",
+    " Road ": " Rd ",
+    " Avenue ": " Ave ",
+    " Lane ": " Ln ",
+    " Court ": " Ct ",
+    " Boulevard ": " Blvd ",
+    " Parkway ": " Pkwy ",
+    " Terrace ": " Ter ",
+    " Circle ": " Cir ",
+  };
+
+  function swapWords(s, map) {
+    let t = ` ${s} `;
+    for (const [k, v] of Object.entries(map)) {
+      t = t.replace(new RegExp(k, "gi"), v);
+    }
+    return t.trim();
+    }
+
+  // Add abbrev <-> full variants
+  variants.add(swapWords(base, abbrToFull));
+  variants.add(swapWords(base, fullToAbbr));
+
+  // Directional variants for numbered streets: e.g., "413 5th St" -> "413 E 5th St" etc.
+  const m = base.match(/^(\d+)\s+([A-Za-z]?\s*)?(\d{1,3}(st|nd|rd|th))\s+(\w+)/i);
+  // Or any "number + word" without existing clear directional:
+  const hasDirectional = /\b(N|S|E|W|NE|NW|SE|SW)\b/i.test(base);
+  if (!hasDirectional) {
+    // Insert directional after the house number
+    const m2 = base.match(/^(\d+)\s+(.*)$/);
+    if (m2) {
+      const dirList = ["E", "W", "N", "S"];
+      for (const d of dirList) {
+        variants.add(`${m2[1]} ${d} ${m2[2]}`);
+      }
+    }
+  }
+
+  return Array.from(variants).filter(Boolean);
 }
 
 /* -------- RapidAPI robust lookup (multiple endpoints + strict validation) -------- */
@@ -152,14 +213,13 @@ async function rapidApiLookupStrict(address, city, state, zip) {
     zip: String(zip || "").trim()
   };
 
-  // Try several common endpoint/param shapes used by Zillow providers on RapidAPI
+  // Try several common endpoint/param shapes used by different providers
   const candidates = [
-    { path: "/property",          params: { address, citystatezip: `${city}, ${state} ${zip || ""}`.trim() } },
-    { path: "/propertyExtended",  params: { address, citystatezip: `${city}, ${state} ${zip || ""}`.trim() } },
-    { path: "/propertyByAddress", params: { address, citystatezip: `${city}, ${state} ${zip || ""}`.trim() } },
-    // Some providers accept separate fields:
-    { path: "/property",          params: { address, city, state, zipcode: zip || "" } },
-    { path: "/propertyDetails",   params: { address, city, state, zipcode: zip || "" } }
+    { path: "/property",          params: (a,c,s,z) => ({ address: a, citystatezip: `${c}, ${s} ${z || ""}`.trim() }) },
+    { path: "/propertyExtended",  params: (a,c,s,z) => ({ address: a, citystatezip: `${c}, ${s} ${z || ""}`.trim() }) },
+    { path: "/propertyByAddress", params: (a,c,s,z) => ({ address: a, citystatezip: `${c}, ${s} ${z || ""}`.trim() }) },
+    { path: "/property",          params: (a,c,s,z) => ({ address: a, city: c, state: s, zipcode: z || "" }) },
+    { path: "/propertyDetails",   params: (a,c,s,z) => ({ address: a, city: c, state: s, zipcode: z || "" }) }
   ];
 
   const toQuery = (obj) =>
@@ -168,47 +228,53 @@ async function rapidApiLookupStrict(address, city, state, zip) {
       .map(([k,v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
       .join("&");
 
-  for (const cand of candidates) {
-    try {
-      const url = `https://${host}${cand.path}?${toQuery(cand.params)}`;
+  // Try original address + generated variants
+  const addrs = generateAddressVariants(address);
 
-      // 20s timeout
-      const ac = new AbortController();
-      const t = setTimeout(() => ac.abort(), 20000);
-      const resp = await fetch(url, {
-        headers: { "X-RapidAPI-Key": key, "X-RapidAPI-Host": host },
-        signal: ac.signal
-      });
-      clearTimeout(t);
+  for (const a of addrs) {
+    for (const cand of candidates) {
+      try {
+        const qs = cand.params(a, city, state, zip);
+        const url = `https://${host}${cand.path}?${toQuery(qs)}`;
 
-      if (!resp.ok) continue;
+        const ac = new AbortController();
+        const t = setTimeout(() => ac.abort(), 20000);
+        const resp = await fetch(url, {
+          headers: { "X-RapidAPI-Key": key, "X-RapidAPI-Host": host },
+          signal: ac.signal
+        });
+        clearTimeout(t);
 
-      const data = await resp.json();
+        if (!resp.ok) continue;
 
-      // Normalize address fields from a few common shapes
-      const gotCity  = (data?.address?.city || data?.city || "").toLowerCase().trim();
-      const gotState = (data?.address?.state || data?.state || "").toLowerCase().trim();
-      const gotZip   = String(data?.address?.zipcode || data?.zipcode || "").trim();
+        const data = await resp.json();
 
-      const cityMatch  = gotCity === want.city;
-      const stateMatch = gotState === want.state;
-      const zipMatch   = !want.zip || gotZip === want.zip;
+        // Normalize address fields
+        const gotCity  = (data?.address?.city || data?.city || "").toLowerCase().trim();
+        const gotState = (data?.address?.state || data?.state || "").toLowerCase().trim();
+        const gotZip   = String(data?.address?.zipcode || data?.zipcode || "").trim();
 
-      // Normalize outputs
-      const zestimate = data?.zestimate ?? data?.result?.zestimate ?? data?.data?.zestimate ?? null;
-      const zpid      = data?.zpid      ?? data?.result?.zpid      ?? data?.data?.zpid      ?? null;
-      const rawUrl    = data?.url ?? data?.result?.url ?? data?.data?.url ?? null;
-      const property_url = rawUrl
-        ? (String(rawUrl).startsWith("http") ? rawUrl : `https://www.zillow.com${rawUrl}`)
-        : null;
+        const cityMatch  = gotCity === want.city;
+        const stateMatch = gotState === want.state;
+        const zipMatch   = !want.zip || gotZip === want.zip;
 
-      if (cityMatch && stateMatch && zipMatch && (zestimate || zpid)) {
-        return { ok: true, zestimate, zpid, property_url, tried: cand.path };
+        const zestimate = data?.zestimate ?? data?.result?.zestimate ?? data?.data?.zestimate ?? null;
+        const zpid      = data?.zpid      ?? data?.result?.zpid      ?? data?.data?.zpid      ?? null;
+
+        const rawUrl = data?.url ?? data?.result?.url ?? data?.data?.url ?? null;
+        const property_url = rawUrl
+          ? (String(rawUrl).startsWith("http") ? rawUrl : `https://www.zillow.com${rawUrl}`)
+          : null;
+
+        if (cityMatch && stateMatch && zipMatch && (zestimate || zpid)) {
+          return { ok: true, zestimate, zpid, property_url, tried: `${cand.path} | addr="${a}"` };
+        }
+      } catch {
+        // ignore and try next candidate/variant
       }
-    } catch {
-      // ignore and try next candidate
     }
   }
+
   return { ok: false, reason: "no-matching-record" };
 }
 
@@ -222,6 +288,23 @@ app.post("/zestimate", async (req, res) => {
   const { address, city, state, zip } = req.body || {};
   if (!address || !city || !state) {
     return res.status(400).json({ ok: false, error: "address, city, state are required" });
+  }
+
+  // Optional: prioritize API first on small instances
+  const preferApi = process.env.PREFER_API_FIRST === "1";
+  if (preferApi && process.env.RAPIDAPI_KEY && process.env.RAPIDAPI_HOST) {
+    const out = await rapidApiLookupStrict(address, city, state, zip);
+    if (out.ok) {
+      return res.status(200).json({
+        ok: true,
+        source: `rapidapi-first ${out.tried}`,
+        property_url: out.property_url,
+        zpid: out.zpid,
+        zestimate: out.zestimate,
+        match_confidence: out.zestimate ? 85 : 60
+      });
+    }
+    // else fall through to Playwright attempt
   }
 
   const searchUrl = buildSearchUrl(address, city, state, zip);
@@ -268,14 +351,11 @@ app.post("/zestimate", async (req, res) => {
             zpid: null,
             property_url: null,
             match_confidence: 0,
-            note: out.reason === "missing-keys"
-              ? "RapidAPI credentials not set."
-              : "No matching record from RapidAPI for the requested city/ZIP."
+            note: "No matching record from RapidAPI for the requested city/ZIP."
           });
         }
       }
 
-      // If no blob and no RapidAPI credentials, return a soft success
       return res.status(200).json({
         ok: true,
         source: searchUrl,
@@ -289,21 +369,17 @@ app.post("/zestimate", async (req, res) => {
 
     // 3) Parse search results
     let root = null;
-    try {
-      root = JSON.parse(blob.text);
-    } catch {}
+    try { root = JSON.parse(blob.text); } catch {}
 
     let listResults =
       root?.props?.pageProps?.searchPageState?.cat1?.searchResults?.listResults;
 
     if (!Array.isArray(listResults)) {
-      // Some stores are serialized differently; try again
       try {
         const store = JSON.parse(blob.text);
         listResults =
           store?.cat1?.searchResults?.listResults ||
-          store?.searchResults?.listResults ||
-          null;
+          store?.searchResults?.listResults || null;
       } catch {}
     }
 
