@@ -1,4 +1,4 @@
-// server.js — Zillow zestimate fetcher (Playwright + RapidAPI fallback w/ city/ZIP validation)
+// server.js — Zillow zestimate fetcher (Playwright + Robust RapidAPI fallback w/ city/ZIP validation)
 import express from "express";
 import { chromium } from "playwright";
 
@@ -139,6 +139,79 @@ function extractZpidAndZestimate(anyObj) {
   return { zpid, zestimate };
 }
 
+/* -------- RapidAPI robust lookup (multiple endpoints + strict validation) -------- */
+
+async function rapidApiLookupStrict(address, city, state, zip) {
+  const host = process.env.RAPIDAPI_HOST;
+  const key  = process.env.RAPIDAPI_KEY;
+  if (!host || !key) return { ok: false, reason: "missing-keys" };
+
+  const want = {
+    city: (city || "").toLowerCase().trim(),
+    state: (state || "").toLowerCase().trim(),
+    zip: String(zip || "").trim()
+  };
+
+  // Try several common endpoint/param shapes used by Zillow providers on RapidAPI
+  const candidates = [
+    { path: "/property",          params: { address, citystatezip: `${city}, ${state} ${zip || ""}`.trim() } },
+    { path: "/propertyExtended",  params: { address, citystatezip: `${city}, ${state} ${zip || ""}`.trim() } },
+    { path: "/propertyByAddress", params: { address, citystatezip: `${city}, ${state} ${zip || ""}`.trim() } },
+    // Some providers accept separate fields:
+    { path: "/property",          params: { address, city, state, zipcode: zip || "" } },
+    { path: "/propertyDetails",   params: { address, city, state, zipcode: zip || "" } }
+  ];
+
+  const toQuery = (obj) =>
+    Object.entries(obj)
+      .filter(([,v]) => v !== undefined && v !== null && String(v).trim() !== "")
+      .map(([k,v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
+      .join("&");
+
+  for (const cand of candidates) {
+    try {
+      const url = `https://${host}${cand.path}?${toQuery(cand.params)}`;
+
+      // 20s timeout
+      const ac = new AbortController();
+      const t = setTimeout(() => ac.abort(), 20000);
+      const resp = await fetch(url, {
+        headers: { "X-RapidAPI-Key": key, "X-RapidAPI-Host": host },
+        signal: ac.signal
+      });
+      clearTimeout(t);
+
+      if (!resp.ok) continue;
+
+      const data = await resp.json();
+
+      // Normalize address fields from a few common shapes
+      const gotCity  = (data?.address?.city || data?.city || "").toLowerCase().trim();
+      const gotState = (data?.address?.state || data?.state || "").toLowerCase().trim();
+      const gotZip   = String(data?.address?.zipcode || data?.zipcode || "").trim();
+
+      const cityMatch  = gotCity === want.city;
+      const stateMatch = gotState === want.state;
+      const zipMatch   = !want.zip || gotZip === want.zip;
+
+      // Normalize outputs
+      const zestimate = data?.zestimate ?? data?.result?.zestimate ?? data?.data?.zestimate ?? null;
+      const zpid      = data?.zpid      ?? data?.result?.zpid      ?? data?.data?.zpid      ?? null;
+      const rawUrl    = data?.url ?? data?.result?.url ?? data?.data?.url ?? null;
+      const property_url = rawUrl
+        ? (String(rawUrl).startsWith("http") ? rawUrl : `https://www.zillow.com${rawUrl}`)
+        : null;
+
+      if (cityMatch && stateMatch && zipMatch && (zestimate || zpid)) {
+        return { ok: true, zestimate, zpid, property_url, tried: cand.path };
+      }
+    } catch {
+      // ignore and try next candidate
+    }
+  }
+  return { ok: false, reason: "no-matching-record" };
+}
+
 /* =============================== Routes =============================== */
 
 app.get("/", (_req, res) => res.send("zillow-scraper: ok"));
@@ -175,78 +248,34 @@ app.post("/zestimate", async (req, res) => {
     // 2) Try to locate any embedded data blob
     const blob = await waitAndGetAnyDataBlob(page);
     if (!blob) {
-      // ---- RapidAPI fallback if configured ----
+      // ---- Robust RapidAPI fallback ----
       if (process.env.RAPIDAPI_KEY && process.env.RAPIDAPI_HOST) {
-        try {
-          const addrOnly = encodeURIComponent(address);
-          const cityzip  = encodeURIComponent(`${city}, ${state} ${zip || ""}`.trim());
-
-          // Build URL with BOTH params (most providers support this)
-          const url = `https://${process.env.RAPIDAPI_HOST}/property?address=${addrOnly}&citystatezip=${cityzip}`;
-
-          // Fetch with timeout
-          const ac = new AbortController();
-          const t = setTimeout(() => ac.abort(), 20000);
-          const resp = await fetch(url, {
-            headers: {
-              "X-RapidAPI-Key": process.env.RAPIDAPI_KEY,
-              "X-RapidAPI-Host": process.env.RAPIDAPI_HOST
-            },
-            signal: ac.signal
+        const out = await rapidApiLookupStrict(address, city, state, zip);
+        if (out.ok) {
+          return res.status(200).json({
+            ok: true,
+            source: `rapidapi-fallback ${out.tried}`,
+            property_url: out.property_url,
+            zpid: out.zpid,
+            zestimate: out.zestimate,
+            match_confidence: out.zestimate ? 85 : 60
           });
-          clearTimeout(t);
-
-          const data = await resp.json();
-
-          // Extract and validate location
-          const respCity  = (data?.address?.city || data?.city || "").toLowerCase().trim();
-          const respState = (data?.address?.state || data?.state || "").toLowerCase().trim();
-          const respZip   = String(data?.address?.zipcode || data?.zipcode || "").trim();
-
-          const wantCity  = (city  || "").toLowerCase().trim();
-          const wantState = (state || "").toLowerCase().trim();
-          const wantZip   = String(zip || "").trim();
-
-          const cityMatch  = respCity === wantCity;
-          const stateMatch = respState === wantState;
-          const zipMatch   = !wantZip || respZip === wantZip;
-
-          // Extract outputs from common shapes
-          const zestimate = data?.zestimate ?? data?.result?.zestimate ?? data?.data?.zestimate ?? null;
-          const zpid      = data?.zpid      ?? data?.result?.zpid      ?? data?.data?.zpid      ?? null;
-
-          const rawUrl =
-            data?.url ?? data?.result?.url ?? data?.data?.url ?? null;
-          const property_url = rawUrl
-            ? (rawUrl.startsWith("http") ? rawUrl : `https://www.zillow.com${rawUrl}`)
-            : null;
-
-          if (cityMatch && stateMatch && zipMatch && (zestimate || zpid)) {
-            return res.status(200).json({
-              ok: true,
-              source: "rapidapi-fallback",
-              property_url,
-              zpid,
-              zestimate,
-              match_confidence: zestimate ? 85 : 60
-            });
-          } else {
-            return res.status(200).json({
-              ok: true,
-              source: "rapidapi-fallback",
-              property_url,
-              zpid: null,
-              zestimate: null,
-              match_confidence: 0,
-              note: `Address mismatch from API. Wanted: ${city}, ${state} ${zip || ""} but got: ${data?.address?.city || data?.city || "?"}, ${data?.address?.state || data?.state || "?"} ${data?.address?.zipcode || data?.zipcode || ""}`
-            });
-          }
-        } catch (_) {
-          // ignore and fall through to original response
+        } else {
+          return res.status(200).json({
+            ok: true,
+            source: "rapidapi-fallback",
+            zestimate: null,
+            zpid: null,
+            property_url: null,
+            match_confidence: 0,
+            note: out.reason === "missing-keys"
+              ? "RapidAPI credentials not set."
+              : "No matching record from RapidAPI for the requested city/ZIP."
+          });
         }
       }
 
-      // If no blob and no RapidAPI (or it failed), return a soft success
+      // If no blob and no RapidAPI credentials, return a soft success
       return res.status(200).json({
         ok: true,
         source: searchUrl,
