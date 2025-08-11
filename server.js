@@ -4,21 +4,129 @@ import { chromium } from "playwright";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// Helper: hyphenate address parts for Zillow search URLs
-const slug = s =>
+// Optional simple auth: set an env var API_KEY; require header X-API-Key to match
+const requireApiKey = !!process.env.API_KEY;
+function checkApiKey(req, res) {
+  if (!requireApiKey) return true;
+  const key = req.get("X-API-Key");
+  if (key && key === process.env.API_KEY) return true;
+  res.status(401).json({ ok: false, error: "Unauthorized" });
+  return false;
+}
+
+const PORT = process.env.PORT || 8080;
+
+// Helpers
+const slug = (s) =>
   String(s || "")
     .trim()
-    .replace(/[.,]/g, "")
+    .replace(/[.,#]/g, "")
     .replace(/\s+/g, "-")
     .toLowerCase();
 
-app.post("/zestimate", async (req, res) => {
-  const { address, city, state, zip } = req.body || {};
-  if (!address || !city || !state) {
-    return res.status(400).json({ ok: false, error: "address, city, state required" });
+const norm = (s) =>
+  String(s || "")
+    .toLowerCase()
+    .replace(/[^\w]/g, "")
+    .trim();
+
+async function getNextData(page) {
+  return await page.evaluate(() => {
+    const el = document.querySelector('script#__NEXT_DATA__');
+    return el ? el.textContent : null;
+  });
+}
+
+function pickBestSearchResult(results, address, city) {
+  const targetAddr = norm(address);
+  const targetCity = norm(city);
+  let best = null;
+  let bestScore = -1;
+
+  for (const r of results || []) {
+    const addrText = norm(r?.address || "");
+    let score = 0;
+    if (addrText.includes(targetAddr)) score += 2;
+    if (addrText.includes(targetCity)) score += 1;
+    if (score > bestScore) {
+      best = r;
+      bestScore = score;
+    }
+  }
+  return { best, score: bestScore };
+}
+
+function extractZpidAndZestimate(anyObj) {
+  if (!anyObj) return { zpid: null, zestimate: null };
+
+  // Try common structured paths first
+  const tryPaths = (obj, paths) => {
+    for (const p of paths) {
+      try {
+        const v = p.split(".").reduce((o, k) => (o ? o[k] : undefined), obj);
+        if (v !== undefined && v !== null) return v;
+      } catch (_) {}
+    }
+    return undefined;
+  };
+
+  const zestimateCandidate = tryPaths(anyObj, [
+    "homeInfo.zestimate",
+    "zestimate",
+    "property.zestimate",
+    "homeDetails.zestimate",
+    "props.pageProps.componentProps.gdpClientCache.default.zestimate"
+  ]);
+
+  const zpidCandidate = tryPaths(anyObj, [
+    "homeInfo.zpid",
+    "zpid",
+    "property.zpid",
+    "props.pageProps.componentProps.zpid"
+  ]);
+
+  let zestimate =
+    typeof zestimateCandidate === "number"
+      ? zestimateCandidate
+      : null;
+  let zpid =
+    typeof zpidCandidate === "number" || typeof zpidCandidate === "string"
+      ? Number(String(zpidCandidate).replace(/\D/g, "")) || null
+      : null;
+
+  // Fallback: regex search through JSON string
+  const asStr = JSON.stringify(anyObj);
+  if (!zestimate) {
+    const m = asStr.match(/"zestimate"\s*:\s*(\d{4,9})/);
+    if (m) zestimate = Number(m[1]);
+  }
+  if (!zpid) {
+    const m2 = asStr.match(/"zpid"\s*:\s*"?(\d+)"?/);
+    if (m2) zpid = Number(m2[1]);
   }
 
-  const searchUrl = `https://www.zillow.com/homes/${slug(address)}-${slug(city)}-${slug(state)}${zip ? "-" + slug(zip) : ""}_rb/`;
+  return { zpid, zestimate };
+}
+
+// Healthcheck
+app.get("/", (_req, res) => {
+  res.send("zillow-scraper: ok");
+});
+
+// Main endpoint
+app.post("/zestimate", async (req, res) => {
+  if (!checkApiKey(req, res)) return;
+
+  const { address, city, state, zip } = req.body || {};
+  if (!address || !city || !state) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "address, city, state are required" });
+  }
+
+  const searchUrl = `https://www.zillow.com/homes/${slug(address)}-${slug(
+    city
+  )}-${slug(state)}${zip ? "-" + slug(zip) : ""}_rb/`;
 
   let browser;
   try {
@@ -30,103 +138,98 @@ app.post("/zestimate", async (req, res) => {
     });
     const page = await ctx.newPage();
 
-    // 1) Open the Zillow search page for the formatted address
+    // 1) Search page
     await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
-
-    // Grab Zillow’s Next.js data from the search page
-    const nextDataSearch = await page.evaluate(() => {
-      const el = document.querySelector('script#__NEXT_DATA__');
-      return el ? el.textContent : null;
-    });
-
+    const nextDataSearch = await getNextData(page);
     if (!nextDataSearch) {
-      throw new Error("Could not read search data");
+      return res.status(200).json({
+        ok: true,
+        source: searchUrl,
+        zestimate: null,
+        zpid: null,
+        property_url: null,
+        match_confidence: 0,
+        note: "No __NEXT_DATA__ on search page."
+      });
     }
 
     const searchJson = JSON.parse(nextDataSearch);
     const results =
-      searchJson?.props?.pageProps?.searchPageState?.cat1?.searchResults?.listResults || [];
+      searchJson?.props?.pageProps?.searchPageState?.cat1?.searchResults
+        ?.listResults || [];
 
-    // Try to find the best matching result (simple contains match)
-    const target = results.find(r => {
-      const a = (r?.address || "").toLowerCase();
-      return a.includes(String(address).toLowerCase()) && a.includes(String(city).toLowerCase());
-    }) || results[0];
-
-    if (!target || !target.detailUrl) {
+    const { best, score } = pickBestSearchResult(results, address, city);
+    if (!best || !best.detailUrl) {
       return res.status(200).json({
         ok: true,
         source: searchUrl,
-        match_confidence: 0,
         zestimate: null,
+        zpid: null,
         property_url: null,
-        note: "No matching property found on search page."
+        match_confidence: 0,
+        note: "No matching property found."
       });
     }
 
-    // 2) Open the property detail page
-    const detailUrl = target.detailUrl.startsWith("http")
-      ? target.detailUrl
-      : `https://www.zillow.com${target.detailUrl}`;
-    await page.goto(detailUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
+    const detailUrl = best.detailUrl.startsWith("http")
+      ? best.detailUrl
+      : `https://www.zillow.com${best.detailUrl}`;
 
-    const nextDataDetail = await page.evaluate(() => {
-      const el = document.querySelector('script#__NEXT_DATA__');
-      return el ? el.textContent : null;
-    });
+    // 2) Detail page
+    await page.goto(detailUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
+    const nextDataDetail = await getNextData(page);
 
     if (!nextDataDetail) {
       return res.status(200).json({
         ok: true,
         source: searchUrl,
-        match_confidence: 50,
-        zestimate: null,
         property_url: detailUrl,
-        note: "No detail JSON found."
+        zestimate: null,
+        zpid: null,
+        match_confidence: Math.max(10, score * 10),
+        note: "No __NEXT_DATA__ on detail page."
       });
     }
 
     const detailJson = JSON.parse(nextDataDetail);
 
-    // Zillow nests the property payload differently depending on page version; search a few likely paths
+    // Try several likely roots
     const candidates = [
-      detailJson?.props?.pageProps?.componentProps?.initialReduxState?.homeDetails,
+      detailJson?.props?.pageProps?.componentProps?.initialReduxState,
       detailJson?.props?.pageProps?.componentProps?.gdpClientCache,
-      detailJson?.props?.pageProps
+      detailJson?.props?.pageProps,
+      detailJson
     ];
 
-    let zestimate = null;
     let zpid = null;
+    let zestimate = null;
 
-    // Try to find a zestimate in known places
     for (const c of candidates) {
-      if (!c) continue;
-      const str = JSON.stringify(c);
-      const match = str.match(/"zestimate"\s*:\s*(\d{4,9})/);
-      if (match) {
-        zestimate = Number(match[1]);
-      }
-      const zpidMatch = str.match(/"zpid"\s*:\s*"?(?\d+)"?/);
-      if (zestimate && zpidMatch) break;
+      const { zpid: zp, zestimate: ze } = extractZpidAndZestimate(c);
+      if (zp && !zpid) zpid = zp;
+      if (ze && !zestimate) zestimate = ze;
+      if (zpid && zestimate) break;
     }
 
-    res.status(200).json({
+    return res.status(200).json({
       ok: true,
       source: searchUrl,
       property_url: detailUrl,
-      zestimate,
       zpid,
-      match_confidence: zestimate ? 90 : 50
+      zestimate,
+      match_confidence: zestimate ? 90 : Math.max(20, score * 10)
     });
   } catch (err) {
-    res.status(200).json({ ok: false, error: err.message });
+    return res.status(200).json({ ok: false, error: String(err?.message || err) });
   } finally {
-    if (browser) await browser.close();
+    if (browser) {
+      try {
+        await browser.close();
+      } catch {}
+    }
   }
 });
 
-// Healthcheck
-app.get("/", (_, res) => res.send("zillow-scraper: ok"));
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Listening on :${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Listening on :${PORT}`);
+});
