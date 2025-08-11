@@ -1,10 +1,15 @@
-// server.js (resilient search + multiple data sources)
+// server.js – Zillow zestimate fetcher with Playwright + RapidAPI fallback
 import express from "express";
 import { chromium } from "playwright";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
+/* ============================ Config / Auth ============================ */
+
+// Optional simple auth (recommended):
+//  - Set env var API_KEY="some-long-string" on Render
+//  - Send header: X-API-Key: <that-string>
 const requireApiKey = !!process.env.API_KEY;
 function checkApiKey(req, res) {
   if (!requireApiKey) return true;
@@ -16,7 +21,7 @@ function checkApiKey(req, res) {
 
 const PORT = process.env.PORT || 8080;
 
-/* ---------------------------- helpers ---------------------------- */
+/* =============================== Helpers ============================== */
 
 const norm = (s) =>
   String(s || "")
@@ -25,7 +30,7 @@ const norm = (s) =>
     .trim();
 
 function buildSearchUrl(address, city, state, zip) {
-  // Use encoded searchQueryState which Zillow accepts reliably
+  // Zillow reliably accepts a JSON-encoded searchQueryState
   const usersSearchTerm = [address, city, state, zip].filter(Boolean).join(", ");
   const sqs = {
     pagination: {},
@@ -40,20 +45,26 @@ function buildSearchUrl(address, city, state, zip) {
   return `https://www.zillow.com/homes/?searchQueryState=${enc}`;
 }
 
+async function getTextFrom(page, selector) {
+  return await page.evaluate((sel) => {
+    const el = document.querySelector(sel);
+    return el ? el.textContent : null;
+  }, selector);
+}
+
 async function waitAndGetAnyDataBlob(page) {
-  // Give the page a moment to render dynamic content
+  // Give the page time to hydrate + try a couple scrolls (reduces bot blocks)
   await page.waitForTimeout(1200);
-  // Try several known script containers
-  const keys = [
+  await page.mouse.wheel(0, 800);
+  await page.waitForTimeout(800);
+
+  const selectors = [
     'script#__NEXT_DATA__',
     'script[data-zrr-shared-data-key="searchPageStore"]',
     'script[data-zrr-shared-data-key="mobileSearchPageStore"]'
   ];
-  for (const sel of keys) {
-    const txt = await page.evaluate((selector) => {
-      const el = document.querySelector(selector);
-      return el ? el.textContent : null;
-    }, sel);
+  for (const sel of selectors) {
+    const txt = await getTextFrom(page, sel);
     if (txt) return { selector: sel, text: txt };
   }
   return null;
@@ -114,6 +125,7 @@ function extractZpidAndZestimate(anyObj) {
       ? Number(String(zpidCandidate).replace(/\D/g, "")) || null
       : null;
 
+  // Fallback regex scan
   const asStr = JSON.stringify(anyObj);
   if (!zestimate) {
     const m = asStr.match(/"zestimate"\s*:\s*(\d{4,9})/);
@@ -127,7 +139,7 @@ function extractZpidAndZestimate(anyObj) {
   return { zpid, zestimate };
 }
 
-/* ----------------------------- routes ----------------------------- */
+/* =============================== Routes =============================== */
 
 app.get("/", (_req, res) => res.send("zillow-scraper: ok"));
 
@@ -143,10 +155,12 @@ app.post("/zestimate", async (req, res) => {
 
   let browser;
   try {
+    // Launch Chromium with flags that work on Render’s containers
     browser = await chromium.launch({
       headless: true,
       args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
     });
+
     const ctx = await browser.newContext({
       userAgent:
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -156,11 +170,57 @@ app.post("/zestimate", async (req, res) => {
     const page = await ctx.newPage();
 
     // 1) Open encoded search page
-    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
 
     // 2) Try to locate any embedded data blob
     const blob = await waitAndGetAnyDataBlob(page);
     if (!blob) {
+      // ---- RapidAPI fallback if configured ----
+      if (process.env.RAPIDAPI_KEY && process.env.RAPIDAPI_HOST) {
+        try {
+          const url = `https://${process.env.RAPIDAPI_HOST}/property?address=${encodeURIComponent(
+            `${address}, ${city}, ${state} ${zip || ""}`.trim()
+          )}`;
+
+          // Fetch with timeout (AbortController)
+          const ac = new AbortController();
+          const t = setTimeout(() => ac.abort(), 20000);
+          const resp = await fetch(url, {
+            headers: {
+              "X-RapidAPI-Key": process.env.RAPIDAPI_KEY,
+              "X-RapidAPI-Host": process.env.RAPIDAPI_HOST
+            },
+            signal: ac.signal
+          });
+          clearTimeout(t);
+
+          const data = await resp.json();
+
+          const zestimate =
+            data?.zestimate ?? data?.result?.zestimate ?? data?.data?.zestimate ?? null;
+
+          const zpid =
+            data?.zpid ?? data?.result?.zpid ?? data?.data?.zpid ?? null;
+
+          const property_url =
+            data?.url ?? data?.result?.url ?? data?.data?.url ?? null;
+
+          if (zestimate || zpid) {
+            return res.status(200).json({
+              ok: true,
+              source: "rapidapi-fallback",
+              property_url,
+              zpid,
+              zestimate,
+              match_confidence: zestimate ? 85 : 60
+            });
+          }
+        } catch (_) {
+          // ignore and fall through to original response
+        }
+      }
+
+      // If no blob and no RapidAPI (or it failed), return a soft success
       return res.status(200).json({
         ok: true,
         source: searchUrl,
@@ -172,21 +232,17 @@ app.post("/zestimate", async (req, res) => {
       });
     }
 
-    // 3) Parse and find search results
-    let root;
+    // 3) Parse search results
+    let root = null;
     try {
       root = JSON.parse(blob.text);
-    } catch {
-      // Some older blobs are JS objects in a string; make one more attempt
-      root = null;
-    }
+    } catch {}
 
-    // Try modern path first
     let listResults =
       root?.props?.pageProps?.searchPageState?.cat1?.searchResults?.listResults;
 
-    // Try legacy search store blobs
     if (!Array.isArray(listResults)) {
+      // Some stores are serialized differently; try again
       try {
         const store = JSON.parse(blob.text);
         listResults =
@@ -221,14 +277,15 @@ app.post("/zestimate", async (req, res) => {
       });
     }
 
-    // 4) Open detail page and extract values
+    // 4) Open detail page and extract zestimate/zpid
     const detailUrl = best.detailUrl.startsWith("http")
       ? best.detailUrl
       : `https://www.zillow.com${best.detailUrl}`;
-    await page.goto(detailUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
 
-    // Try detail blobs
+    await page.goto(detailUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+
     const detailBlob = await waitAndGetAnyDataBlob(page);
+
     let zpid = null;
     let zestimate = null;
 
@@ -265,7 +322,7 @@ app.post("/zestimate", async (req, res) => {
   }
 });
 
-/* ------------------------------ start ------------------------------ */
+/* ============================== Startup ============================== */
 
 app.listen(PORT, () => {
   console.log(`Listening on :${PORT}`);
