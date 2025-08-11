@@ -1,15 +1,10 @@
-// server.js
+// server.js (resilient search + multiple data sources)
 import express from "express";
 import { chromium } from "playwright";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-/**
- * Optional simple auth:
- *   - Set env var API_KEY="some-long-string"
- *   - Send header X-API-Key: <that-string> with requests
- */
 const requireApiKey = !!process.env.API_KEY;
 function checkApiKey(req, res) {
   if (!requireApiKey) return true;
@@ -21,14 +16,7 @@ function checkApiKey(req, res) {
 
 const PORT = process.env.PORT || 8080;
 
-/* ---------------------------- small helpers ---------------------------- */
-
-const slug = (s) =>
-  String(s || "")
-    .trim()
-    .replace(/[.,#]/g, "")
-    .replace(/\s+/g, "-")
-    .toLowerCase();
+/* ---------------------------- helpers ---------------------------- */
 
 const norm = (s) =>
   String(s || "")
@@ -36,11 +24,39 @@ const norm = (s) =>
     .replace(/[^\w]/g, "")
     .trim();
 
-async function getNextData(page) {
-  return await page.evaluate(() => {
-    const el = document.querySelector('script#__NEXT_DATA__');
-    return el ? el.textContent : null;
-  });
+function buildSearchUrl(address, city, state, zip) {
+  // Use encoded searchQueryState which Zillow accepts reliably
+  const usersSearchTerm = [address, city, state, zip].filter(Boolean).join(", ");
+  const sqs = {
+    pagination: {},
+    mapBounds: { west: -180, east: 180, south: -90, north: 90 },
+    usersSearchTerm,
+    regionSelection: [],
+    isMapVisible: false,
+    filterState: {},
+    isListVisible: true
+  };
+  const enc = encodeURIComponent(JSON.stringify(sqs));
+  return `https://www.zillow.com/homes/?searchQueryState=${enc}`;
+}
+
+async function waitAndGetAnyDataBlob(page) {
+  // Give the page a moment to render dynamic content
+  await page.waitForTimeout(1200);
+  // Try several known script containers
+  const keys = [
+    'script#__NEXT_DATA__',
+    'script[data-zrr-shared-data-key="searchPageStore"]',
+    'script[data-zrr-shared-data-key="mobileSearchPageStore"]'
+  ];
+  for (const sel of keys) {
+    const txt = await page.evaluate((selector) => {
+      const el = document.querySelector(selector);
+      return el ? el.textContent : null;
+    }, sel);
+    if (txt) return { selector: sel, text: txt };
+  }
+  return null;
 }
 
 function pickBestSearchResult(results, address, city) {
@@ -65,13 +81,12 @@ function pickBestSearchResult(results, address, city) {
 function extractZpidAndZestimate(anyObj) {
   if (!anyObj) return { zpid: null, zestimate: null };
 
-  // Try common structured paths
   const tryPaths = (obj, paths) => {
     for (const p of paths) {
       try {
         const v = p.split(".").reduce((o, k) => (o ? o[k] : undefined), obj);
         if (v !== undefined && v !== null) return v;
-      } catch (_) {}
+      } catch {}
     }
     return undefined;
   };
@@ -99,7 +114,6 @@ function extractZpidAndZestimate(anyObj) {
       ? Number(String(zpidCandidate).replace(/\D/g, "")) || null
       : null;
 
-  // Fallback: regex scan of full JSON string
   const asStr = JSON.stringify(anyObj);
   if (!zestimate) {
     const m = asStr.match(/"zestimate"\s*:\s*(\d{4,9})/);
@@ -113,45 +127,40 @@ function extractZpidAndZestimate(anyObj) {
   return { zpid, zestimate };
 }
 
-/* ------------------------------- routes -------------------------------- */
+/* ----------------------------- routes ----------------------------- */
 
-app.get("/", (_req, res) => {
-  res.send("zillow-scraper: ok");
-});
+app.get("/", (_req, res) => res.send("zillow-scraper: ok"));
 
 app.post("/zestimate", async (req, res) => {
   if (!checkApiKey(req, res)) return;
 
   const { address, city, state, zip } = req.body || {};
   if (!address || !city || !state) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "address, city, state are required" });
+    return res.status(400).json({ ok: false, error: "address, city, state are required" });
   }
 
-  const searchUrl = `https://www.zillow.com/homes/${slug(address)}-${slug(
-    city
-  )}-${slug(state)}${zip ? "-" + slug(zip) : ""}_rb/`;
+  const searchUrl = buildSearchUrl(address, city, state, zip);
 
   let browser;
   try {
-    // Launch Chromium with flags that work in Render containers
     browser = await chromium.launch({
       headless: true,
       args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
     });
-
     const ctx = await browser.newContext({
       userAgent:
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      viewport: { width: 1366, height: 900 }
+      viewport: { width: 1366, height: 900 },
+      locale: "en-US"
     });
     const page = await ctx.newPage();
 
-    // 1) Search page
+    // 1) Open encoded search page
     await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
-    const nextDataSearch = await getNextData(page);
-    if (!nextDataSearch) {
+
+    // 2) Try to locate any embedded data blob
+    const blob = await waitAndGetAnyDataBlob(page);
+    if (!blob) {
       return res.status(200).json({
         ok: true,
         source: searchUrl,
@@ -159,16 +168,47 @@ app.post("/zestimate", async (req, res) => {
         zpid: null,
         property_url: null,
         match_confidence: 0,
-        note: "No __NEXT_DATA__ on search page."
+        note: "No search data blob found."
       });
     }
 
-    const searchJson = JSON.parse(nextDataSearch);
-    const results =
-      searchJson?.props?.pageProps?.searchPageState?.cat1?.searchResults
-        ?.listResults || [];
+    // 3) Parse and find search results
+    let root;
+    try {
+      root = JSON.parse(blob.text);
+    } catch {
+      // Some older blobs are JS objects in a string; make one more attempt
+      root = null;
+    }
 
-    const { best, score } = pickBestSearchResult(results, address, city);
+    // Try modern path first
+    let listResults =
+      root?.props?.pageProps?.searchPageState?.cat1?.searchResults?.listResults;
+
+    // Try legacy search store blobs
+    if (!Array.isArray(listResults)) {
+      try {
+        const store = JSON.parse(blob.text);
+        listResults =
+          store?.cat1?.searchResults?.listResults ||
+          store?.searchResults?.listResults ||
+          null;
+      } catch {}
+    }
+
+    if (!Array.isArray(listResults) || listResults.length === 0) {
+      return res.status(200).json({
+        ok: true,
+        source: searchUrl,
+        zestimate: null,
+        zpid: null,
+        property_url: null,
+        match_confidence: 0,
+        note: "No search results in blob."
+      });
+    }
+
+    const { best, score } = pickBestSearchResult(listResults, address, city);
     if (!best || !best.detailUrl) {
       return res.status(200).json({
         ok: true,
@@ -181,43 +221,33 @@ app.post("/zestimate", async (req, res) => {
       });
     }
 
+    // 4) Open detail page and extract values
     const detailUrl = best.detailUrl.startsWith("http")
       ? best.detailUrl
       : `https://www.zillow.com${best.detailUrl}`;
-
-    // 2) Detail page
     await page.goto(detailUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
-    const nextDataDetail = await getNextData(page);
 
-    if (!nextDataDetail) {
-      return res.status(200).json({
-        ok: true,
-        source: searchUrl,
-        property_url: detailUrl,
-        zestimate: null,
-        zpid: null,
-        match_confidence: Math.max(10, score * 10),
-        note: "No __NEXT_DATA__ on detail page."
-      });
-    }
-
-    const detailJson = JSON.parse(nextDataDetail);
-
-    const candidates = [
-      detailJson?.props?.pageProps?.componentProps?.initialReduxState,
-      detailJson?.props?.pageProps?.componentProps?.gdpClientCache,
-      detailJson?.props?.pageProps,
-      detailJson
-    ];
-
+    // Try detail blobs
+    const detailBlob = await waitAndGetAnyDataBlob(page);
     let zpid = null;
     let zestimate = null;
 
-    for (const c of candidates) {
-      const { zpid: zp, zestimate: ze } = extractZpidAndZestimate(c);
-      if (zp && !zpid) zpid = zp;
-      if (ze && !zestimate) zestimate = ze;
-      if (zpid && zestimate) break;
+    if (detailBlob) {
+      try {
+        const detailRoot = JSON.parse(detailBlob.text);
+        const candidates = [
+          detailRoot?.props?.pageProps?.componentProps?.initialReduxState,
+          detailRoot?.props?.pageProps?.componentProps?.gdpClientCache,
+          detailRoot?.props?.pageProps,
+          detailRoot
+        ];
+        for (const c of candidates) {
+          const { zpid: zp, zestimate: ze } = extractZpidAndZestimate(c);
+          if (zp && !zpid) zpid = zp;
+          if (ze && !zestimate) zestimate = ze;
+          if (zpid && zestimate) break;
+        }
+      } catch {}
     }
 
     return res.status(200).json({
@@ -226,22 +256,16 @@ app.post("/zestimate", async (req, res) => {
       property_url: detailUrl,
       zpid,
       zestimate,
-      match_confidence: zestimate ? 90 : Math.max(20, score * 10)
+      match_confidence: zestimate ? 90 : Math.max(20, (score || 0) * 10)
     });
   } catch (err) {
-    return res
-      .status(200)
-      .json({ ok: false, error: String(err?.message || err) });
+    return res.status(200).json({ ok: false, error: String(err?.message || err) });
   } finally {
-    if (browser) {
-      try {
-        await browser.close();
-      } catch {}
-    }
+    try { if (browser) await browser.close(); } catch {}
   }
 });
 
-/* -------------------------------- start -------------------------------- */
+/* ------------------------------ start ------------------------------ */
 
 app.listen(PORT, () => {
   console.log(`Listening on :${PORT}`);
