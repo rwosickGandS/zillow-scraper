@@ -1,4 +1,4 @@
-// server.js – Zillow zestimate fetcher with Playwright + RapidAPI fallback
+// server.js — Zillow zestimate fetcher (Playwright + RapidAPI fallback)
 import express from "express";
 import { chromium } from "playwright";
 
@@ -7,7 +7,7 @@ app.use(express.json({ limit: "1mb" }));
 
 /* ============================ Config / Auth ============================ */
 
-// Optional simple auth (recommended):
+// Optional simple auth:
 //  - Set env var API_KEY="some-long-string" on Render
 //  - Send header: X-API-Key: <that-string>
 const requireApiKey = !!process.env.API_KEY;
@@ -30,7 +30,7 @@ const norm = (s) =>
     .trim();
 
 function buildSearchUrl(address, city, state, zip) {
-  // Zillow reliably accepts a JSON-encoded searchQueryState
+  // Zillow accepts a JSON-encoded searchQueryState reliably
   const usersSearchTerm = [address, city, state, zip].filter(Boolean).join(", ");
   const sqs = {
     pagination: {},
@@ -53,7 +53,7 @@ async function getTextFrom(page, selector) {
 }
 
 async function waitAndGetAnyDataBlob(page) {
-  // Give the page time to hydrate + try a couple scrolls (reduces bot blocks)
+  // Give the page time to hydrate and try a small scroll to trigger loaders
   await page.waitForTimeout(1200);
   await page.mouse.wheel(0, 800);
   await page.waitForTimeout(800);
@@ -125,7 +125,7 @@ function extractZpidAndZestimate(anyObj) {
       ? Number(String(zpidCandidate).replace(/\D/g, "")) || null
       : null;
 
-  // Fallback regex scan
+  // Fallback regex scan across the serialized JSON
   const asStr = JSON.stringify(anyObj);
   if (!zestimate) {
     const m = asStr.match(/"zestimate"\s*:\s*(\d{4,9})/);
@@ -182,7 +182,7 @@ app.post("/zestimate", async (req, res) => {
             `${address}, ${city}, ${state} ${zip || ""}`.trim()
           )}`;
 
-          // Fetch with timeout (AbortController)
+          // Fetch with timeout
           const ac = new AbortController();
           const t = setTimeout(() => ac.abort(), 20000);
           const resp = await fetch(url, {
