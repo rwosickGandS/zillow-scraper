@@ -1,12 +1,12 @@
 {
   "name": "zillow-scraper",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "module",
   "main": "server.js",
   "private": false,
   "scripts": {
     "start": "node server.js",
-    "postinstall": "npx playwright install --with-deps chromium"
+    "postinstall": "npx playwright install chromium"
   },
   "dependencies": {
     "express": "^4.19.2",

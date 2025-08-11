@@ -1,10 +1,15 @@
+// server.js
 import express from "express";
 import { chromium } from "playwright";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// Optional simple auth: set an env var API_KEY; require header X-API-Key to match
+/**
+ * Optional simple auth:
+ *   - Set env var API_KEY="some-long-string"
+ *   - Send header X-API-Key: <that-string> with requests
+ */
 const requireApiKey = !!process.env.API_KEY;
 function checkApiKey(req, res) {
   if (!requireApiKey) return true;
@@ -16,7 +21,8 @@ function checkApiKey(req, res) {
 
 const PORT = process.env.PORT || 8080;
 
-// Helpers
+/* ---------------------------- small helpers ---------------------------- */
+
 const slug = (s) =>
   String(s || "")
     .trim()
@@ -59,7 +65,7 @@ function pickBestSearchResult(results, address, city) {
 function extractZpidAndZestimate(anyObj) {
   if (!anyObj) return { zpid: null, zestimate: null };
 
-  // Try common structured paths first
+  // Try common structured paths
   const tryPaths = (obj, paths) => {
     for (const p of paths) {
       try {
@@ -86,15 +92,14 @@ function extractZpidAndZestimate(anyObj) {
   ]);
 
   let zestimate =
-    typeof zestimateCandidate === "number"
-      ? zestimateCandidate
-      : null;
+    typeof zestimateCandidate === "number" ? zestimateCandidate : null;
+
   let zpid =
     typeof zpidCandidate === "number" || typeof zpidCandidate === "string"
       ? Number(String(zpidCandidate).replace(/\D/g, "")) || null
       : null;
 
-  // Fallback: regex search through JSON string
+  // Fallback: regex scan of full JSON string
   const asStr = JSON.stringify(anyObj);
   if (!zestimate) {
     const m = asStr.match(/"zestimate"\s*:\s*(\d{4,9})/);
@@ -108,12 +113,12 @@ function extractZpidAndZestimate(anyObj) {
   return { zpid, zestimate };
 }
 
-// Healthcheck
+/* ------------------------------- routes -------------------------------- */
+
 app.get("/", (_req, res) => {
   res.send("zillow-scraper: ok");
 });
 
-// Main endpoint
 app.post("/zestimate", async (req, res) => {
   if (!checkApiKey(req, res)) return;
 
@@ -130,7 +135,12 @@ app.post("/zestimate", async (req, res) => {
 
   let browser;
   try {
-    browser = await chromium.launch({ headless: true });
+    // Launch Chromium with flags that work in Render containers
+    browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+    });
+
     const ctx = await browser.newContext({
       userAgent:
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -193,7 +203,6 @@ app.post("/zestimate", async (req, res) => {
 
     const detailJson = JSON.parse(nextDataDetail);
 
-    // Try several likely roots
     const candidates = [
       detailJson?.props?.pageProps?.componentProps?.initialReduxState,
       detailJson?.props?.pageProps?.componentProps?.gdpClientCache,
@@ -220,7 +229,9 @@ app.post("/zestimate", async (req, res) => {
       match_confidence: zestimate ? 90 : Math.max(20, score * 10)
     });
   } catch (err) {
-    return res.status(200).json({ ok: false, error: String(err?.message || err) });
+    return res
+      .status(200)
+      .json({ ok: false, error: String(err?.message || err) });
   } finally {
     if (browser) {
       try {
@@ -229,6 +240,8 @@ app.post("/zestimate", async (req, res) => {
     }
   }
 });
+
+/* -------------------------------- start -------------------------------- */
 
 app.listen(PORT, () => {
   console.log(`Listening on :${PORT}`);
