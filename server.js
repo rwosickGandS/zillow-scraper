@@ -2,7 +2,7 @@
 // - Playwright scrape (fallback)
 // - Robust RapidAPI fallback (multi-endpoint + city/ZIP validation + address variants)
 // - PREFER_API_FIRST=1 to skip Chromium on small instances
-// - Expanded JSON response with many Zillow fields
+// - Expanded JSON response with many Zillow fields (incl. parking, sewer, water, taxAssessedValue)
 
 import express from "express";
 import { chromium } from "playwright";
@@ -243,6 +243,7 @@ async function rapidApiLookupStrict(address, city, state, zip) {
 
         const data = await resp.json();
 
+        // Normalize returned address
         const gotCity = (data?.address?.city || data?.city || "").toLowerCase().trim();
         const gotState = (data?.address?.state || data?.state || "").toLowerCase().trim();
         const gotZip = String(data?.address?.zipcode || data?.zipcode || "").trim();
@@ -251,10 +252,31 @@ async function rapidApiLookupStrict(address, city, state, zip) {
         const stateMatch = gotState === want.state;
         const zipMatch = !want.zip || gotZip === want.zip;
 
-        if (cityMatch && stateMatch && zipMatch) {
-          return { ok: true, tried: cand.path + ` | addr=${address}`, data };
+        // Extract essentials
+        const zestimate =
+          data?.zestimate ?? data?.result?.zestimate ?? data?.data?.zestimate ?? null;
+        const zpid = data?.zpid ?? data?.result?.zpid ?? data?.data?.zpid ?? null;
+
+        const rawUrl = data?.url ?? data?.result?.url ?? data?.data?.url ?? null;
+        const property_url = rawUrl
+          ? String(rawUrl).startsWith("http")
+            ? rawUrl
+            : `https://www.zillow.com${rawUrl}`
+          : null;
+
+        if (cityMatch && stateMatch && zipMatch && (zestimate || zpid)) {
+          return {
+            ok: true,
+            tried: cand.path + ` | addr="${a}"`,
+            zestimate,
+            zpid,
+            property_url,
+            data, // pass the raw payload so we can map lots of fields in the route
+          };
         }
-      } catch {}
+      } catch {
+        // ignore and try next candidate/variant
+      }
     }
   }
 
@@ -275,53 +297,362 @@ app.post("/zestimate", async (req, res) => {
       .json({ ok: false, error: "address, city, state are required" });
   }
 
+  // Prefer RapidAPI first on small instances
   const preferApi = process.env.PREFER_API_FIRST === "1";
   if (preferApi && process.env.RAPIDAPI_KEY && process.env.RAPIDAPI_HOST) {
     const out = await rapidApiLookupStrict(address, city, state, zip);
-    if (out.ok) return sendExpanded(out.data, address, res);
+    if (out.ok) return sendExpanded(out, res);
+    // fall through to Playwright if API couldn't match
   }
 
-  // ... (Playwright fallback unchanged for brevity)
+  const searchUrl = buildSearchUrl(address, city, state, zip);
+
+  let browser;
+  try {
+    // Playwright Chromium
+    browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+    });
+
+    const ctx = await browser.newContext({
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      viewport: { width: 1366, height: 900 },
+      locale: "en-US",
+    });
+    const page = await ctx.newPage();
+
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+
+    const blob = await waitAndGetAnyDataBlob(page);
+    if (!blob) {
+      // Try RapidAPI fallback
+      if (process.env.RAPIDAPI_KEY && process.env.RAPIDAPI_HOST) {
+        const out = await rapidApiLookupStrict(address, city, state, zip);
+        if (out.ok) return sendExpanded(out, res);
+        return res.status(200).json({
+          ok: true,
+          source: "rapidapi-fallback",
+          zestimate: null,
+          zpid: null,
+          property_url: null,
+          match_confidence: 0,
+          note: "No matching record from RapidAPI for the requested city/ZIP.",
+        });
+      }
+
+      return res.status(200).json({
+        ok: true,
+        source: searchUrl,
+        zestimate: null,
+        zpid: null,
+        property_url: null,
+        match_confidence: 0,
+        note: "No search data blob found.",
+      });
+    }
+
+    // Parse search results
+    let root = null;
+    try {
+      root = JSON.parse(blob.text);
+    } catch {}
+
+    let listResults =
+      root?.props?.pageProps?.searchPageState?.cat1?.searchResults?.listResults;
+
+    if (!Array.isArray(listResults)) {
+      try {
+        const store = JSON.parse(blob.text);
+        listResults =
+          store?.cat1?.searchResults?.listResults ||
+          store?.searchResults?.listResults ||
+          null;
+      } catch {}
+    }
+
+    if (!Array.isArray(listResults) || listResults.length === 0) {
+      return res.status(200).json({
+        ok: true,
+        source: searchUrl,
+        zestimate: null,
+        zpid: null,
+        property_url: null,
+        match_confidence: 0,
+        note: "No search results in blob.",
+      });
+    }
+
+    const { best, score } = pickBestSearchResult(listResults, address, city);
+    if (!best || !best.detailUrl) {
+      return res.status(200).json({
+        ok: true,
+        source: searchUrl,
+        zestimate: null,
+        zpid: null,
+        property_url: null,
+        match_confidence: 0,
+        note: "No matching property found.",
+      });
+    }
+
+    const detailUrl = best.detailUrl.startsWith("http")
+      ? best.detailUrl
+      : `https://www.zillow.com${best.detailUrl}`;
+
+    await page.goto(detailUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+
+    const detailBlob = await waitAndGetAnyDataBlob(page);
+
+    let zpid = null;
+    let zestimate = null;
+
+    // NEW: fields requested for Playwright path
+    let parking = null;
+    let parkingFeatures = null;
+    let sewer = null;
+    let water = null;
+    let taxAssessedValue = null;
+    let county = null;
+
+    if (detailBlob) {
+      try {
+        const detailRoot = JSON.parse(detailBlob.text);
+        const candidates = [
+          detailRoot?.props?.pageProps?.componentProps?.initialReduxState,
+          detailRoot?.props?.pageProps?.componentProps?.gdpClientCache,
+          detailRoot?.props?.pageProps,
+          detailRoot,
+        ];
+        for (const c of candidates) {
+          const { zpid: zp, zestimate: ze } = extractZpidAndZestimate(c);
+          if (zp && !zpid) zpid = zp;
+          if (ze && !zestimate) zestimate = ze;
+
+          // attempt to pick extra details from common Zillow shapes
+          const tryPick = (paths) => {
+            for (const p of paths) {
+              try {
+                const v = p.split(".").reduce((o, k) => (o ? o[k] : undefined), c);
+                if (v !== undefined && v !== null) return v;
+              } catch {}
+            }
+            return null;
+          };
+
+          if (parking === null)
+            parking = tryPick([
+              "property.parking",
+              "homeDetails.parking",
+              "resoFacts.parking",
+              "data.parking",
+            ]);
+
+          if (parkingFeatures === null)
+            parkingFeatures = tryPick([
+              "resoFacts.parkingFeatures",
+              "homeFacts.parkingFeatures",
+              "property.parkingFeatures",
+              "data.parkingFeatures",
+            ]);
+
+          if (sewer === null)
+            sewer = tryPick([
+              "resoFacts.sewer",
+              "homeFacts.sewer",
+              "property.sewer",
+              "data.sewer",
+            ]);
+
+          if (water === null)
+            water = tryPick([
+              "resoFacts.waterSource",
+              "homeFacts.water",
+              "homeFacts.waterSource",
+              "property.waterSource",
+              "property.water",
+              "data.waterSource",
+              "data.water",
+            ]);
+
+          if (taxAssessedValue === null)
+            taxAssessedValue = tryPick([
+              "taxAssessedValue",
+              "resoFacts.taxAssessedValue",
+              "homeFacts.taxAssessedValue",
+              "property.taxAssessedValue",
+              "data.taxAssessedValue",
+            ]);
+
+          if (county === null)
+            county = tryPick([
+              "address.county",
+              "property.address.county",
+              "result.address.county",
+              "county",
+              "property.county",
+            ]);
+
+          if (zpid && zestimate && (parking !== null || sewer !== null || water !== null || taxAssessedValue !== null || county !== null)) {
+            // good enough; continue to response
+          }
+        }
+      } catch {}
+    }
+
+    return res.status(200).json({
+      ok: true,
+      source: searchUrl,
+      property_url: detailUrl,
+      zpid,
+      zestimate,
+      match_confidence: zestimate ? 90 : Math.max(20, (score || 0) * 10),
+
+      // Added Zillow info (Playwright path)
+      parking,
+      parkingFeatures,
+      sewer,
+      water,
+      taxAssessedValue,
+      county,
+    });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: String(err?.message || err) });
+  } finally {
+    try {
+      if (browser) await browser.close();
+    } catch {}
+  }
 });
 
 /* ===================== Expanded response builder (RapidAPI) ==================== */
 
-function sendExpanded(data, address, res) {
-  return res.status(200).json({
+function sendExpanded(out, res) {
+  const d = out.data || {};
+
+  const pick = (...paths) => {
+    for (const p of paths) {
+      try {
+        const v = p.split(".").reduce((o, k) => (o ? o[k] : undefined), d);
+        if (v !== undefined && v !== null) return v;
+      } catch {}
+    }
+    return null;
+  };
+
+  const zestimate =
+    out.zestimate ??
+    (pick("zestimate") ?? pick("result.zestimate") ?? pick("data.zestimate"));
+
+  // Low/High absolute or derived from percent bands if available
+  const zLowAbs = pick("zestimateLow", "result.zestimateLow", "data.zestimateLow");
+  const zHighAbs = pick("zestimateHigh", "result.zestimateHigh", "data.zestimateHigh");
+  const zLowPct = Number(pick("zestimateLowPercent", "result.zestimateLowPercent", "data.zestimateLowPercent"));
+  const zHighPct = Number(pick("zestimateHighPercent", "result.zestimateHighPercent", "data.zestimateHighPercent"));
+
+  const zestimateLow =
+    zLowAbs ??
+    (Number.isFinite(zestimate) && Number.isFinite(zLowPct)
+      ? Math.round(zestimate * (1 - zLowPct / 100))
+      : null);
+
+  const zestimateHigh =
+    zHighAbs ??
+    (Number.isFinite(zestimate) && Number.isFinite(zHighPct)
+      ? Math.round(zestimate * (1 + zHighPct / 100))
+      : null);
+
+  const priceHistory = pick("priceHistory", "result.priceHistory") || [];
+
+  // Derive last sold from history if not provided directly
+  const lastSoldDirectPrice = pick("lastSoldPrice", "result.lastSoldPrice");
+  const lastSoldDirectDate = pick("lastSoldDate", "result.lastSoldDate");
+  let lastSoldPrice = lastSoldDirectPrice;
+  let lastSoldDate = lastSoldDirectDate;
+
+  if ((!lastSoldPrice || !lastSoldDate) && Array.isArray(priceHistory)) {
+    const sold = priceHistory.find((e) =>
+      String(e?.event || e?.type || "").toLowerCase().includes("sold")
+    );
+    if (!lastSoldPrice && sold?.price != null) lastSoldPrice = sold.price;
+    if (!lastSoldDate && sold?.date) lastSoldDate = sold.date;
+  }
+
+  const property_url = out.property_url;
+
+  const payload = {
     ok: true,
-    source: "rapidapi-fallback /property | addr=" + address,
-    property_url: data?.property?.url || null,
-    zpid: data?.property?.zpid || null,
-    homeType: data?.property?.homeType || null,
-    yearBuilt: data?.property?.yearBuilt || null,
-    lotSize: data?.property?.lotSize || data?.property?.lotAreaValue || null,
-    livingArea: data?.property?.livingArea || data?.property?.livingAreaValue || null,
-    numBedrooms: data?.property?.bedrooms || null,
-    numBathrooms: data?.property?.bathrooms || null,
-    numFloors: data?.property?.numFloors || null,
-    numParkingSpaces: data?.property?.numParkingSpaces || null,
-    parking: data?.property?.parking || null,
-    parkingFeatures: data?.property?.parkingFeatures || null,
-    sewer: data?.property?.sewer || null,
-    water: data?.property?.water || null,
-    taxAssessedValue: data?.property?.taxAssessedValue || null,
-    county: data?.property?.county || null,
-    zestimate: data?.property?.zestimate || null,
-    zestimateLow: data?.property?.zestimateLow || null,
-    zestimateHigh: data?.property?.zestimateHigh || null,
-    rentZestimate: data?.property?.rentZestimate || null,
-    lastSoldPrice: data?.property?.lastSoldPrice || null,
-    lastSoldDate: data?.property?.lastSoldDate || null,
-    homeStatus: data?.property?.homeStatus || null,
-    monthlyHoaFee: data?.property?.monthlyHoaFee || null,
-    taxAnnualAmount: data?.property?.taxAnnualAmount || null,
-    priceHistory: data?.property?.priceHistory || [],
-    pool: data?.property?.pool || null,
-    garageSpaces: data?.property?.garageSpaces || null,
-    roofType: data?.property?.roofType || null,
-    imgSrc: data?.property?.imgSrc || null,
-    photos: data?.property?.photos || []
-  });
+    source: `rapidapi-fallback ${out.tried}`,
+    property_url,
+
+    // Identification
+    zpid: out.zpid ?? pick("zpid", "result.zpid", "data.zpid"),
+
+    // Basic property info
+    homeType: pick("homeType", "propertyTypeDimension", "result.homeType", "data.homeType"),
+    yearBuilt: pick("yearBuilt", "result.yearBuilt"),
+    lotSize: pick("lotSize", "lotAreaValue", "result.lotSize", "result.lotAreaValue"),
+    livingArea: pick("livingArea", "livingAreaValue", "result.livingArea", "result.livingAreaValue"),
+    numBedrooms: pick("bedrooms", "numBedrooms", "result.bedrooms", "result.numBedrooms"),
+    numBathrooms: pick("bathrooms", "bathroomsFloat", "numBathrooms", "result.bathrooms", "result.bathroomsFloat"),
+    numFloors: pick("stories", "storiesDecimal", "result.stories", "result.storiesDecimal"),
+    numParkingSpaces: pick(
+      "parkingCapacity",
+      "garageParkingCapacity",
+      "coveredParkingCapacity",
+      "result.parkingCapacity",
+      "result.garageParkingCapacity",
+      "result.coveredParkingCapacity"
+    ),
+
+    // Valuation / price
+    zestimate,
+    zestimateLow,
+    zestimateHigh,
+    rentZestimate: pick("rentZestimate", "result.rentZestimate"),
+
+    // Last sold info
+    lastSoldPrice,
+    lastSoldDate,
+
+    // Status & costs
+    homeStatus: pick("homeStatus", "result.homeStatus"),
+    monthlyHoaFee: pick("monthlyHoaFee", "result.monthlyHoaFee"),
+    taxAnnualAmount: pick("taxAnnualAmount", "result.taxAnnualAmount"),
+    taxAssessedValue: pick("taxAssessedValue", "resoFacts.taxAssessedValue", "result.taxAssessedValue"),
+
+    // History arrays
+    priceHistory,
+
+    // Features
+    pool:
+      pick("hasPrivatePool", "pool", "result.hasPrivatePool", "result.pool") ??
+      (Array.isArray(pick("poolFeatures")) ? true : null),
+    garageSpaces: pick("garageParkingCapacity", "coveredParkingCapacity", "result.garageParkingCapacity"),
+    roofType: pick("roofType", "result.roofType"),
+
+    // NEW: Parking + utilities
+    parking: pick("parking", "otherParking", "result.parking", "result.otherParking"),
+    parkingFeatures: pick("parkingFeatures", "result.parkingFeatures"),
+    sewer: pick("sewer", "result.sewer"),
+    water: pick("waterSource", "water", "result.waterSource", "result.water"),
+
+    // Media
+    imgSrc: pick("imgSrc", "result.imgSrc"),
+    photos: pick("photos", "result.photos", "miniCardPhotos") || [],
+
+    // Location
+    county: pick("county", "address.county", "result.county", "result.address.county"),
+
+    // Confidence
+    match_confidence: zestimate ? 85 : 60,
+
+    // (Optional) include raw for debugging/mapping in Zapier:
+    // raw: d
+  };
+
+  return res.status(200).json(payload);
 }
 
 /* ============================== Startup ============================== */

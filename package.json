@@ -1,15 +1,29 @@
 {
-  "name": "zillow-scraper",
-  "version": "1.0.2",
-  "type": "module",
-  "main": "server.js",
-  "private": false,
-  "scripts": {
-    "start": "node server.js",
-    "postinstall": "npx playwright install chromium"
-  },
-  "dependencies": {
-    "express": "^4.19.2",
-    "playwright": "^1.46.0"
-  }
+    "name":  "zillow-scraper",
+    "version":  "1.0.2",
+    "type":  "module",
+    "main":  "server.js",
+    "private":  false,
+    "scripts":  {
+                    "start":  "node server.js",
+                    "postinstall":  "npx playwright install chromium"
+                },
+    "dependencies":  {
+                         "express":  "^4.21.2",
+                         "playwright":  "^1.54.2"
+                     },
+    "description":  "",
+    "repository":  {
+                       "type":  "git",
+                       "url":  "git+https://github.com/rwosickGandS/zillow-scraper.git"
+                   },
+    "keywords":  [
+
+                 ],
+    "author":  "",
+    "license":  "ISC",
+    "bugs":  {
+                 "url":  "https://github.com/rwosickGandS/zillow-scraper/issues"
+             },
+    "homepage":  "https://github.com/rwosickGandS/zillow-scraper#readme"
 }
